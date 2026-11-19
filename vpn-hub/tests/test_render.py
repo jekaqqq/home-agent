@@ -238,6 +238,18 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(_names(by_mode)["main"], ["myvpn-main-01", "myvpn-main-02"])
         self.assertEqual([p["server"] for p in by_mode["main"]], ["203.0.113.2", "203.0.113.5"])
 
+    def test_duplicate_endpoints_across_profiles_collapse(self):
+        same = _vless(address="203.0.113.2", stream=_reality_stream())
+        other = _vless(address="203.0.113.9", stream=_reality_stream(shortId="ffff"))
+        profiles = [
+            _profile("Автоматический", same, _vless(address="203.0.113.2", stream=_reality_stream())),
+            _profile("Обход LTE", same),
+            _profile("Для WiFi", same, other),
+        ]
+        proxies = render.extract_proxies(profiles, dialect="generic", prefix="happ")["main"]
+        self.assertEqual([p["name"] for p in proxies], ["happ-main-01", "happ-main-02"])
+        self.assertEqual([p["server"] for p in proxies], ["203.0.113.2", "203.0.113.9"])
+
     def test_two_outbounds_in_one_profile_are_numbered_without_gaps(self):
         first = _vless(address="203.0.113.1", stream=_reality_stream())
         second = _vless(address="203.0.113.2", stream=_reality_stream())

@@ -469,6 +469,25 @@ def extract_proxies(xray_profiles, dialect: str = "generic", prefix: str | None 
             if proxy is None:
                 continue
             out[tag].append(proxy)
+    # Happ-style feeds repeat the same vless endpoints inside several full
+    # client configs ("Автоматический", "Обход LTE", ...). The difference is
+    # routing, which a proxy-provider cannot express, so keep the first copy.
+    for tag, proxies in out.items():
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for proxy in proxies:
+            identity = json.dumps(
+                {key: value for key, value in proxy.items() if key != "name"},
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(proxy)
+        for index, proxy in enumerate(unique, start=1):
+            proxy["name"] = f"{prefix}-{tag}-{index:02d}"
+        out[tag] = unique
     return out
 
 

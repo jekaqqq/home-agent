@@ -19,7 +19,7 @@ sources:
     user_agent: "V2Box"          # some panels gate nodes by client UA
     dialect: "generic"           # generic = every node → "main" (see README → Dialects)
     # headers:                   # extra headers if your panel needs them
-    #   x-hwid: "REPLACE-with-a-fixed-uuid"
+    #   x-hwid: "REPLACE-with-a-fixed-uuid"  # Happ returns 400 SUBSCRIPTION_HWID_REQUIRED without it
 
   # Second source example. Remove if you only have one subscription.
   # othervpn:
