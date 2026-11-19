@@ -1,0 +1,38 @@
+# Caddy config for vpn-hub. Install at /etc/caddy/Caddyfile.
+#
+# Two listeners:
+#   :80    → ACME HTTP-01 challenge + redirect (Caddy auto-serves /.well-known/acme-challenge/*)
+#   :8443  → TLS reverse-proxy to vpn-hub on 127.0.0.1:8080
+#
+# Before reload:
+#   1. Replace sub.example.com with your domain (DNS A-record → this server).
+#   2. Replace __USERNAME__ and __PASSWORD_HASH__.
+#      Hash: `caddy hash-password` (prompts for a password, prints the bcrypt hash).
+#   3. In @hub, list your actual endpoints (one per source key in config.yaml).
+
+{
+    # No email — auto-renew works without ACME notifications.
+}
+
+http://sub.example.com {
+    redir https://sub.example.com:8443{uri} permanent
+}
+
+sub.example.com:8443 {
+    basic_auth {
+        __USERNAME__ __PASSWORD_HASH__
+    }
+
+    @hub path /myvpn.yaml /healthz
+    handle @hub {
+        reverse_proxy 127.0.0.1:8080
+    }
+    handle {
+        respond 404
+    }
+
+    log {
+        output file /var/log/caddy/vpn-hub.log
+        format json
+    }
+}

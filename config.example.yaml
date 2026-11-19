@@ -1,0 +1,27 @@
+# vpn-hub config — copy to /etc/vpn-hub/config.yaml and fill in your own values.
+#
+# Subscription-only bridge: on each GET /<name>.yaml the source is live-pulled,
+# converted xray-JSON → mihomo proxy-provider format, and served. The on-disk
+# cache in state_dir is failover-only (used when upstream is unreachable, or
+# when the response converts to zero vless nodes).
+
+listen: 127.0.0.1:8080
+state_dir: /var/lib/vpn-hub
+
+sources:
+  # Key rules: [A-Za-z0-9._-], starts with a letter or digit, at most 64 chars.
+  # The key is the URL path (/<key>.yaml) and the cache filename, so it cannot
+  # escape state_dir. Node names are <key>-{main|antiblock|backup}-NN.
+  myvpn:
+    url: "https://REPLACE-with-your-subscription-url"
+    user_agent: "V2Box"          # some panels gate nodes by client UA
+    dialect: generic             # generic = every node → "main" (see README → Dialects)
+    # timeout: 15                # upstream pull timeout, seconds
+    # headers:                   # extra headers if your panel needs them
+    #   x-hwid: "REPLACE-with-a-fixed-uuid"
+
+  # Second source example. Remove if you only have one subscription.
+  # othervpn:
+  #   url: "https://REPLACE"
+  #   user_agent: "Happ/3.6.0"
+  #   dialect: generic
