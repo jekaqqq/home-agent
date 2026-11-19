@@ -25,7 +25,7 @@ sub.example.com:8443 {
         __USERNAME__ __PASSWORD_HASH__
     }
 
-    @hub path /myvpn.yaml /healthz
+    @hub path /myvpn.yaml /myvpn.router.yaml /healthz
     handle @hub {
         reverse_proxy 127.0.0.1:8080
     }

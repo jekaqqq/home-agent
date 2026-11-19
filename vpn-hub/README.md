@@ -126,6 +126,27 @@ curl -u LOGIN:PASSWORD -D- -o- https://sub.example.com:8443/myvpn.yaml | head -3
 в `xhttp-opts` так же, как это делает конвертер mihomo. Старый плоский вид
 (`xPaddingBytes` и `reuseSettings` рядом с `path`) тоже принимается.
 
+## Роутер
+
+`/<source>.router.yaml` — целый конфиг mihomo, его и надо загружать на роутер
+(OpenClash, nikki, Clash Verge в режиме конфига). Внутри ноды, группа `VPN`
+(автовыбор или DIRECT) и правила:
+
+- приватные сети, SSH и торрент-порты — напрямую, если так сказано в подписке;
+- домены, которые подписка помечает direct (VK, Kion и остальные) — напрямую;
+- весь остальной трафик — в `VPN`.
+
+В панели роутера группу `VPN` можно переключить на `DIRECT`, не трогая правила.
+Свои правила целиком задаются в `router.rules` в конфиге хаба.
+
+```yaml
+# OpenClash: тип подписки Clash. nikki: URL конфига.
+url: "https://LOGIN:PASSWORD@sub.example.com:8443/myvpn.router.yaml"
+```
+
+Порты в файле: mixed `7890`, redir `7892`, tproxy `7893`, DNS `1053`.
+Пакету роутера нужны `geoip` и `geosite` (OpenClash и nikki качают их сами).
+
 ## Клиентская сторона (mihomo)
 
 Ноды подключаются в локальный mihomo-профиль как proxy-provider, группы

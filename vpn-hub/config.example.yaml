@@ -18,11 +18,23 @@ sources:
     url: "https://REPLACE-with-your-subscription-url"
     user_agent: "V2Box"          # some panels gate nodes by client UA
     dialect: "generic"           # generic = every node → "main" (see README → Dialects)
-    # headers:                   # extra headers if your panel needs them
-    #   x-hwid: "REPLACE-with-a-fixed-uuid"  # Happ returns 400 SUBSCRIPTION_HWID_REQUIRED without it
+    # A Happ install link (https://host/happ?token=...) is rewritten to /api/sub.
+    # If the panel answers SUBSCRIPTION_HWID_REQUIRED and x-hwid is omitted,
+    # the hub retries once with the stable id "vpn-hub".
+    # headers:
+    #   x-hwid: "REPLACE-with-a-fixed-uuid"
 
   # Second source example. Remove if you only have one subscription.
   # othervpn:
   #   url: "https://REPLACE"
   #   user_agent: "Happ/3.6.0"
   #   dialect: "generic"
+
+# Optional. Served at /<source>.router.yaml — the file a router imports.
+# Without `rules`, direct domains/IPs are taken from the subscription itself,
+# and everything else goes to the VPN group (switchable to DIRECT in the UI).
+# router:
+#   rules:
+#     - GEOIP,private,DIRECT,no-resolve
+#     - GEOSITE,category-ru,DIRECT
+#     - MATCH,VPN

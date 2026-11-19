@@ -238,6 +238,57 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(_names(by_mode)["main"], ["myvpn-main-01", "myvpn-main-02"])
         self.assertEqual([p["server"] for p in by_mode["main"]], ["203.0.113.2", "203.0.113.5"])
 
+    def test_happ_install_url_points_at_the_json_feed(self):
+        rewritten = render.normalize_subscription_url("https://clolinks.example/happ?token=abc")
+        self.assertEqual(rewritten, "https://clolinks.example/api/sub?token=abc")
+        self.assertEqual(
+            render.normalize_subscription_url("https://clolinks.example/api/sub?token=abc"),
+            "https://clolinks.example/api/sub?token=abc",
+        )
+
+    def test_router_config_keeps_subscription_direct_rules(self):
+        stream = _reality_stream()
+        profiles = [
+            {
+                "remarks": "Автоматический",
+                "outbounds": [_vless(address="203.0.113.2", stream=stream)],
+                "routing": {
+                    "rules": [
+                        {"type": "field", "outboundTag": "direct", "ip": ["10.0.0.0/8", "not-a-cidr"]},
+                        {
+                            "type": "field",
+                            "outboundTag": "direct",
+                            "domain": ["domain:vk.ru", "full:kion.ru", "geosite:private", "regexp:a,b"],
+                        },
+                        {"type": "field", "outboundTag": "direct", "port": "22", "protocol": ["bittorrent"]},
+                        {"type": "field", "outboundTag": "proxy", "network": "tcp"},
+                    ]
+                },
+            },
+            _profile("ещё раз", _vless(address="203.0.113.2", stream=stream)),
+        ]
+        policy = render.extract_policy(profiles)
+        self.assertIn("DOMAIN-SUFFIX,vk.ru,DIRECT", policy["domain_rules"])
+        self.assertIn("DOMAIN,kion.ru,DIRECT", policy["domain_rules"])
+        self.assertIn("GEOSITE,private,DIRECT", policy["domain_rules"])
+        self.assertNotIn("DOMAIN-REGEX,a,b,DIRECT", policy["domain_rules"])
+        self.assertEqual(policy["cidr_rules"], ["IP-CIDR,10.0.0.0/8,DIRECT,no-resolve"])
+        self.assertEqual(policy["port_rules"], ["DST-PORT,22,DIRECT", "DST-PORT,6881-6999,DIRECT"])
+
+        by_mode = render.extract_proxies(profiles, prefix="myvpn")
+        body = render.render_router(by_mode, policy)
+        loaded = render.yaml.safe_load(body)
+        self.assertEqual(loaded["mode"], "rule")
+        self.assertTrue(loaded["allow-lan"])
+        self.assertEqual(loaded["proxies"][0]["name"], "myvpn-main-01")
+        self.assertEqual(loaded["proxy-groups"][0]["name"], "VPN")
+        self.assertEqual(loaded["proxy-groups"][0]["proxies"], ["AUTO", "DIRECT"])
+        self.assertIn("DOMAIN-SUFFIX,vk.ru,DIRECT", loaded["rules"])
+        self.assertEqual(loaded["rules"][-1], "MATCH,VPN")
+
+        overridden = render.yaml.safe_load(render.render_router(by_mode, policy, {"rules": ["MATCH,DIRECT"]}))
+        self.assertEqual(overridden["rules"], ["MATCH,DIRECT"])
+
     def test_duplicate_endpoints_across_profiles_collapse(self):
         same = _vless(address="203.0.113.2", stream=_reality_stream())
         other = _vless(address="203.0.113.9", stream=_reality_stream(shortId="ffff"))
@@ -345,6 +396,7 @@ class ConfigTests(unittest.TestCase):
     def test_templates_mention_the_deploy_contract(self):
         caddy = (ROOT / "Caddyfile.example").read_text(encoding="utf-8")
         self.assertIn("basic_auth", caddy)
+        self.assertIn("/myvpn.router.yaml", caddy)
         self.assertIn("127.0.0.1:8080", caddy)
         self.assertIn("__PASSWORD_HASH__", caddy)
         unit = (ROOT / "systemd" / "vpn-hub.service").read_text(encoding="utf-8")
@@ -447,10 +499,16 @@ class HttpTests(unittest.TestCase):
             # refuses to write a second header.
             self.assertEqual(resp.headers.get("subscription-userinfo"), "upload=1")
             self.assertIsNone(resp.headers.get("X-Injected"))
-            state.userinfo["myvpn"] = "upload=9\r\nX-Injected: yes"
             self.assertEqual(resp.headers.get("profile-update-interval"), "1")
             self.assertEqual(render.yaml.safe_load(body)["proxies"][0]["name"], "myvpn-main-01")
+            router = render.yaml.safe_load(
+                urllib.request.urlopen(base + "/myvpn.router.yaml", timeout=5).read().decode()
+            )
+            self.assertEqual(router["mode"], "rule")
+            self.assertEqual(router["rules"][-1], "MATCH,VPN")
+            self.assertEqual(router["proxies"][0]["server"], "203.0.113.10")
             self.assertEqual(upstream.seen[-1], ("V2Box", "fixed"))
+            state.userinfo["myvpn"] = "upload=9\r\nX-Injected: yes"
 
             health = urllib.request.urlopen(base + "/healthz", timeout=5)
             self.assertIn("ok=True", health.read().decode())

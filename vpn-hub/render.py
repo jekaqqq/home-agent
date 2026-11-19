@@ -418,26 +418,176 @@ def sanitize_header_value(value: str | None) -> str | None:
     return cleaned or None
 
 
+def normalize_subscription_url(url: str) -> str:
+    """Happ install pages (/happ?token=) are HTML. The JSON feed is /api/sub."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return url
+    if parsed.path.rstrip("/") != "/happ":
+        return url
+    query = urllib.parse.parse_qs(parsed.query)
+    if "token" not in query and "id" not in query:
+        return url
+    rewritten = urllib.parse.urlunparse(parsed._replace(path="/api/sub"))
+    log.info("subscription URL path /happ rewritten to /api/sub")
+    return rewritten
+
+
+def _http_get(url: str, headers: dict, timeout: int, max_bytes: int) -> tuple[bytes, str | None]:
+    req = urllib.request.Request(url, headers=headers)
+    # Ignore HTTP(S)_PROXY from the environment: the hub dials the subscription itself.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SafeRedirect)
+    with opener.open(req, timeout=timeout) as resp:
+        body = resp.read(max_bytes + 1)
+        userinfo = sanitize_header_value(resp.headers.get("subscription-userinfo"))
+    return body, userinfo
+
+
 def fetch_source(src: dict, timeout: int = 15, max_bytes: int = MAX_UPSTREAM_BYTES) -> tuple[list | dict, str | None]:
     """Pull upstream subscription. Returns (xray JSON, subscription-userinfo)."""
-    parsed = urllib.parse.urlparse(src["url"])
+    url = normalize_subscription_url(src["url"])
+    parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError("source URL must be http(s)")
     headers = {"User-Agent": src.get("user_agent") or "vpn-hub"}
     extra = src.get("headers") or {}
     if isinstance(extra, dict):
         headers.update({str(k): str(v) for k, v in extra.items()})
-    req = urllib.request.Request(src["url"], headers=headers)
-    # Ignore HTTP(S)_PROXY from the environment: the hub dials the subscription itself.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _SafeRedirect)
-    with opener.open(req, timeout=timeout) as resp:
-        body = resp.read(max_bytes + 1)
-        userinfo = sanitize_header_value(resp.headers.get("subscription-userinfo"))
+    try:
+        body, userinfo = _http_get(url, headers, timeout, max_bytes)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(512)
+        sent_hwid = any(key.lower() == "x-hwid" for key in headers)
+        if exc.code == 400 and b"SUBSCRIPTION_HWID_REQUIRED" in detail and not sent_hwid:
+            log.info("panel requires x-hwid; retrying with a stable vpn-hub device id")
+            headers = dict(headers)
+            headers["x-hwid"] = "vpn-hub"
+            body, userinfo = _http_get(url, headers, timeout, max_bytes)
+        else:
+            raise
     if len(body) > max_bytes:
         raise ValueError(f"upstream body exceeds {max_bytes} bytes")
     if body.startswith(b"\xef\xbb\xbf"):
         body = body[3:]
     return json.loads(body), userinfo
+
+
+def _mihomo_domain_rule(token: str) -> str | None:
+    """xray domain matcher → one mihomo rule that sends the name DIRECT."""
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    if not token or any(ch in token for ch in ",\r\n\t "):
+        return None
+    kind, sep, value = token.partition(":")
+    kinds = {
+        "domain": "DOMAIN-SUFFIX",
+        "full": "DOMAIN",
+        "keyword": "DOMAIN-KEYWORD",
+        "regexp": "DOMAIN-REGEX",
+        "geosite": "GEOSITE",
+    }
+    if sep and kind in kinds and value:
+        return f"{kinds[kind]},{value},DIRECT"
+    return f"DOMAIN-KEYWORD,{token},DIRECT"
+
+
+def _mihomo_cidr_rule(token: str) -> str | None:
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    if not token or any(ch in token for ch in ",\r\n\t "):
+        return None
+    if ":" in token and "/" in token:
+        return f"IP-CIDR6,{token},DIRECT,no-resolve"
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}", token):
+        return f"IP-CIDR,{token},DIRECT,no-resolve"
+    return None
+
+
+def _mihomo_port_rules(port, protocols) -> list[str]:
+    rules: list[str] = []
+    parts: list[str] = []
+    if isinstance(port, bool):
+        port = None
+    if isinstance(port, int):
+        parts.append(str(port))
+    elif isinstance(port, str):
+        parts.extend(piece.strip() for piece in port.split(","))
+    for part in parts:
+        if re.fullmatch(r"\d{1,5}(?:-\d{1,5})?", part or ""):
+            rules.append(f"DST-PORT,{part},DIRECT")
+    if isinstance(protocols, list) and any(item == "bittorrent" for item in protocols):
+        rules.append("DST-PORT,6881-6999,DIRECT")
+    return rules
+
+
+def _dedupe(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def extract_policy(xray_profiles) -> dict:
+    """Direct-routing from the fullest xray profile, as mihomo rule lines.
+
+    Happ feeds ship several full client configs. Their proxy endpoints repeat;
+    the part that matters on a router is which domains and networks stay direct.
+    """
+    profiles = [xray_profiles] if isinstance(xray_profiles, dict) else xray_profiles
+    if not isinstance(profiles, list):
+        return {"domain_rules": [], "cidr_rules": [], "port_rules": []}
+    best_rules: list = []
+    best_score = -1
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        rules = (profile.get("routing") or {}).get("rules") or []
+        if not isinstance(rules, list):
+            continue
+        score = 0
+        for rule in rules:
+            if not isinstance(rule, dict) or str(rule.get("outboundTag") or "").lower() != "direct":
+                continue
+            score += len(rule.get("domain") or []) + len(rule.get("ip") or [])
+        if score > best_score:
+            best_score = score
+            best_rules = rules
+    domains: list[str] = []
+    cidrs: list[str] = []
+    ports: list[str] = []
+    for rule in best_rules:
+        if not isinstance(rule, dict) or str(rule.get("outboundTag") or "").lower() != "direct":
+            continue
+        for domain in rule.get("domain") or []:
+            converted = _mihomo_domain_rule(domain)
+            if converted:
+                domains.append(converted)
+        for ip in rule.get("ip") or []:
+            converted = _mihomo_cidr_rule(ip)
+            if converted:
+                cidrs.append(converted)
+        ports.extend(_mihomo_port_rules(rule.get("port"), rule.get("protocol")))
+    return {
+        "domain_rules": _dedupe(domains),
+        "cidr_rules": _dedupe(cidrs),
+        "port_rules": _dedupe(ports),
+    }
+
+
+# Used when the subscription itself has no domain/IP routing.
+DEFAULT_ROUTER_RULES = [
+    "GEOIP,private,DIRECT,no-resolve",
+    "GEOSITE,private,DIRECT",
+    "GEOSITE,category-ru,DIRECT",
+    "GEOIP,ru,DIRECT",
+    "MATCH,VPN",
+]
 
 
 def extract_proxies(xray_profiles, dialect: str = "generic", prefix: str | None = None) -> dict:
@@ -509,10 +659,99 @@ def render_provider(state: "State", source: str) -> str:
     return render_provider_from(by_mode)
 
 
+def _dump_yaml(document) -> str:
+    return yaml.safe_dump(
+        document,
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=200,
+    )
+
+
+def render_router(by_mode: dict, policy: dict | None = None, router_cfg: dict | None = None) -> str:
+    """Full mihomo config for a router: nodes, a VPN/DIRECT switch, and rules.
+
+    Russian and local names from the subscription stay direct. Everything else
+    goes to the VPN group, which the router UI can flip to DIRECT.
+    """
+    policy = policy or {}
+    router_cfg = router_cfg or {}
+    proxies = list(by_mode.get("main") or []) + list(by_mode.get("antiblock") or []) + list(by_mode.get("backup") or [])
+    names = [proxy["name"] for proxy in proxies if isinstance(proxy, dict) and proxy.get("name")]
+    if names:
+        groups = [
+            {"name": "VPN", "type": "select", "proxies": ["AUTO", "DIRECT"]},
+            {
+                "name": "AUTO",
+                "type": "url-test",
+                "proxies": names,
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": 300,
+                "tolerance": 50,
+                "lazy": True,
+            },
+        ]
+    else:
+        groups = [{"name": "VPN", "type": "select", "proxies": ["DIRECT"]}]
+
+    custom = router_cfg.get("rules")
+    if isinstance(custom, list) and custom:
+        rules = [str(rule) for rule in custom]
+    else:
+        domains = list(policy.get("domain_rules") or [])
+        cidrs = list(policy.get("cidr_rules") or [])
+        ports = list(policy.get("port_rules") or [])
+        if domains or cidrs or ports:
+            rules = ["GEOIP,private,DIRECT,no-resolve", *ports, *cidrs, *domains]
+            if not any(rule.startswith("MATCH,") for rule in rules):
+                rules.append("MATCH,VPN")
+        else:
+            rules = list(DEFAULT_ROUTER_RULES)
+
+    document = {
+        "mixed-port": int(router_cfg.get("mixed_port") or 7890),
+        "redir-port": int(router_cfg.get("redir_port") or 7892),
+        "tproxy-port": int(router_cfg.get("tproxy_port") or 7893),
+        "allow-lan": True,
+        "bind-address": "*",
+        "mode": "rule",
+        "log-level": "warning",
+        "ipv6": False,
+        "unified-delay": True,
+        "tcp-concurrent": True,
+        "find-process-mode": "off",
+        "dns": {
+            "enable": True,
+            "listen": "0.0.0.0:1053",
+            "enhanced-mode": "fake-ip",
+            "fake-ip-range": "198.18.0.1/16",
+            "fake-ip-filter": ["*.lan", "*.local", "localhost.ptlogin2.qq.com"],
+            "default-nameserver": ["77.88.8.8", "1.1.1.1"],
+            "nameserver": ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"],
+            "proxy-server-nameserver": ["77.88.8.8", "1.1.1.1"],
+        },
+        "sniffer": {
+            "enable": True,
+            "force-dns-mapping": True,
+            "parse-pure-ip": True,
+            "sniff": {
+                "HTTP": {"ports": [80, "8080-8880"]},
+                "TLS": {"ports": [443, 8443]},
+            },
+        },
+        "proxies": proxies,
+        "proxy-groups": groups,
+        "rules": rules,
+    }
+    return _dump_yaml(document)
+
+
 class State:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.proxies: dict[str, dict] = {}
+        self.policies: dict[str, dict] = {}
         self.userinfo: dict[str, str | None] = {}
         self.last_pull_ok: dict[str, float] = {}
 
@@ -554,19 +793,30 @@ def load_cache(state_dir: Path, state: State, sources: dict) -> None:
                 log.warning("%s: cache parse failed: %s", name, e)
         if uj.exists():
             state.userinfo[name] = sanitize_header_value(uj.read_text(encoding="utf-8").strip())
+        policy_path = _cache_path(state_dir, name, "policy.json")
+        if policy_path.exists():
+            try:
+                state.policies[name] = json.loads(policy_path.read_text(encoding="utf-8"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("%s: policy cache parse failed: %s", name, e)
 
 
-def save_cache(state_dir: Path, source: str, by_mode: dict, userinfo: str | None) -> None:
-    state_dir.mkdir(parents=True, exist_ok=True)
-    _tighten(state_dir, 0o750)
-    pj = _cache_path(state_dir, source, "proxies.json")
+def _write_json(state_dir: Path, path: Path, payload) -> None:
     with tempfile.NamedTemporaryFile(
         "w", dir=state_dir, delete=False, encoding="utf-8", newline="\n"
     ) as handle:
-        json.dump(by_mode, handle, ensure_ascii=False)
+        json.dump(payload, handle, ensure_ascii=False)
         tmp = Path(handle.name)
-    tmp.replace(pj)
-    _tighten(pj, 0o640)
+    tmp.replace(path)
+    _tighten(path, 0o640)
+
+
+def save_cache(state_dir: Path, source: str, by_mode: dict, userinfo: str | None, policy: dict | None = None) -> None:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    _tighten(state_dir, 0o750)
+    _write_json(state_dir, _cache_path(state_dir, source, "proxies.json"), by_mode)
+    if policy is not None:
+        _write_json(state_dir, _cache_path(state_dir, source, "policy.json"), policy)
     if userinfo:
         uj = _cache_path(state_dir, source, "userinfo")
         uj.write_text(userinfo + "\n", encoding="utf-8")
@@ -587,17 +837,25 @@ def refresh_once(cfg: dict, state: State, source: str) -> bool:
     try:
         xray_profiles, userinfo = fetch_source(src, timeout=timeout)
         by_mode = extract_proxies(xray_profiles, dialect=dialect, prefix=source)
+        policy = extract_policy(xray_profiles)
         counts = {k: len(v) for k, v in by_mode.items()}
-        log.info("%s pulled: %s userinfo=%s", source, counts, userinfo)
+        log.info(
+            "%s pulled: %s direct_rules=%s userinfo=%s",
+            source,
+            counts,
+            len(policy["domain_rules"]) + len(policy["cidr_rules"]) + len(policy["port_rules"]),
+            userinfo,
+        )
     except Exception as e:  # noqa: BLE001
         log.warning("%s pull failed: %s", source, e)
         return False
     with state.lock:
         state.proxies[source] = by_mode
+        state.policies[source] = policy
         state.userinfo[source] = userinfo
         state.last_pull_ok[source] = time.time()
     try:
-        save_cache(Path(cfg["state_dir"]), source, by_mode, userinfo)
+        save_cache(Path(cfg["state_dir"]), source, by_mode, userinfo, policy)
     except Exception as e:  # noqa: BLE001
         log.warning("%s: cache write failed: %s", source, e)
     return True
@@ -613,6 +871,17 @@ def _request_path(raw: str) -> str:
     if "://" in path:
         path = urllib.parse.urlparse(raw).path
     return path
+
+
+def subscription_target(path: str, sources: dict) -> tuple[str, str] | None:
+    """Return (source, kind) for /<source>.yaml or /<source>.router.yaml."""
+    name = path.removeprefix("/")
+    for suffix, kind in ((".router.yaml", "router"), (".yaml", "provider")):
+        if name.endswith(suffix):
+            source = name[: -len(suffix)]
+            if source in sources:
+                return source, kind
+    return None
 
 
 def make_handler(cfg: dict, state: State):
@@ -636,16 +905,19 @@ def make_handler(cfg: dict, state: State):
                 self.wfile.write(body)
                 return
 
-            source = path.removeprefix("/").removesuffix(".yaml")
-            if not path.endswith(".yaml") or source not in cfg["sources"]:
+            target = subscription_target(path, cfg["sources"])
+            if target is None:
                 self.send_response(404)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            source, kind = target
 
             fresh = refresh_once(cfg, state, source)
             with state.lock:
                 current = state.proxies.get(source)
+                raw_policy = state.policies.get(source) or {}
+                policy = dict(raw_policy) if isinstance(raw_policy, dict) else {}
                 userinfo = state.userinfo.get(source)
                 if current is not None:
                     current = {key: list(value) for key, value in current.items()}
@@ -660,7 +932,10 @@ def make_handler(cfg: dict, state: State):
                 log.info("%s: serving from stale cache (upstream unreachable)", source)
 
             try:
-                body = render_provider_from(current)
+                if kind == "router":
+                    body = render_router(current, policy, cfg.get("router") or {})
+                else:
+                    body = render_provider_from(current)
             except Exception as e:  # noqa: BLE001
                 log.exception("%s: render failed: %s", source, e)
                 self.send_response(500)
@@ -748,6 +1023,17 @@ def load_config(path: Path) -> dict:
             timeout = src["timeout"]
             if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 120:
                 raise ValueError(f"{name}: timeout must be a whole number of seconds from 1 to 120")
+    router = loaded.get("router") or {}
+    if router:
+        if not isinstance(router, dict):
+            raise ValueError("router must be a mapping")
+        rules = router.get("rules")
+        if rules is not None:
+            if not isinstance(rules, list) or not rules:
+                raise ValueError("router.rules must be a non-empty list of mihomo rules")
+            for rule in rules:
+                if not isinstance(rule, str) or not rule.strip() or any(ch in rule for ch in "\r\n"):
+                    raise ValueError("router.rules entries must be single-line strings")
     return loaded
 
 
