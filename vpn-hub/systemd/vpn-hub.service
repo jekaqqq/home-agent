@@ -1,0 +1,36 @@
+[Unit]
+Description=vpn-hub: xray-JSON → mihomo subscription bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpn-hub
+Group=vpn-hub
+ExecStart=/usr/bin/python3 /opt/vpn-hub/render.py
+Restart=always
+RestartSec=10
+StateDirectory=vpn-hub
+ConfigurationDirectory=vpn-hub
+ConfigurationDirectoryMode=0750
+StateDirectoryMode=0750
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vpn-hub
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target
