@@ -61,11 +61,22 @@ def detect_mode_generic(remarks: str) -> str:
     return "main"
 
 
+def detect_mode_clo(remarks: str) -> str:
+    # «Автоматический» — xray-балансировщик тех же нод, что и профили «Обход LTE».
+    # В mihomo url-test делает то же самое, поэтому агрегат пропускаем.
+    if "Автоматический" in remarks:
+        return "unknown"
+    if "Обход LTE" in remarks:
+        return "antiblock"
+    return "main"
+
+
 # fingerprint: "random" hardcodes utls fp; "upstream" mirrors the fp the
 # subscription ships (falls back to random when absent).
 DIALECTS = {
     "govpn": {"detect": detect_mode_govpn, "fingerprint": "random"},
     "buzzvpn": {"detect": detect_mode_buzzvpn, "fingerprint": "upstream"},
+    "clo": {"detect": detect_mode_clo, "fingerprint": "upstream"},
     "generic": {"detect": detect_mode_generic, "fingerprint": "upstream"},
 }
 
@@ -316,7 +327,9 @@ def extract_proxies(payload: object, dialect: str = "generic", prefix: str | Non
     spec = DIALECTS[dialect]
     prefix = prefix or dialect
     out: dict[str, list] = {bucket: [] for bucket in BUCKETS}
+    seen: dict[str, set[str]] = {bucket: set() for bucket in BUCKETS}
     skipped = 0
+    duplicates = 0
     for profile in normalize_profiles(payload):
         remarks = profile.get("remarks") or ""
         if not isinstance(remarks, str):
@@ -344,9 +357,24 @@ def extract_proxies(payload: object, dialect: str = "generic", prefix: str | Non
             if proxy is None:
                 skipped += 1
                 continue
+            # Happ/xray balancers repeat the same outbound in several profiles.
+            # Keep the first copy in each bucket; a later bucket may still
+            # carry the same endpoint under its own name.
+            identity = json.dumps(
+                {key: value for key, value in proxy.items() if key != "name"},
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            )
+            if identity in seen[tag]:
+                duplicates += 1
+                continue
+            seen[tag].add(identity)
             out[tag].append(proxy)
     if skipped:
         log.info("%s: skipped %d outbound(s)", prefix, skipped)
+    if duplicates:
+        log.info("%s: skipped %d duplicate outbound(s)", prefix, duplicates)
     return out
 
 

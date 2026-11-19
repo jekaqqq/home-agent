@@ -257,6 +257,31 @@ class ConvertTests(unittest.TestCase):
         self.assertEqual(userinfo, state.userinfo["govpn"])
         self.assertIn("udp: true", text)
 
+    def test_clo_splits_lte_and_drops_duplicate_profiles(self):
+        auto = profile("🇳🇱 Автоматический 👻", address="203.0.113.1", port=4443, fingerprint="qq", flow=None)
+        second = profile("ignored", address="203.0.113.2", port=5269, fingerprint="qq", flow=None)["outbounds"][0]
+        auto["outbounds"].insert(1, second)
+        lte_a = profile("🇳🇱Обход LTE 🎻", address="203.0.113.1", port=4443, fingerprint="qq", flow=None)
+        lte_a["outbounds"].insert(1, second)
+        lte_b = profile("🇳🇱Обход LTE 🥁", address="203.0.113.1", port=4443, fingerprint="qq", flow=None)
+        lte_b["outbounds"].insert(1, json.loads(json.dumps(second)))
+        wifi = profile("🇳🇱Для WiFi, ПК и ТВ 💻", address="203.0.113.1", port=4443, fingerprint="qq", flow=None)
+        proxies = render.extract_proxies([auto, lte_a, lte_b, wifi], dialect="clo", prefix="clo")
+        self.assertEqual(proxies["backup"], [])
+        self.assertEqual(
+            [(p["name"], p["server"], p["port"]) for p in proxies["antiblock"]],
+            [("clo-antiblock-01", "203.0.113.1", 4443), ("clo-antiblock-02", "203.0.113.2", 5269)],
+        )
+        self.assertEqual([p["name"] for p in proxies["main"]], ["clo-main-01"])
+        self.assertEqual(proxies["antiblock"][0]["client-fingerprint"], "qq")
+        self.assertNotIn("flow", proxies["main"][0])
+
+    def test_duplicate_outbound_inside_one_profile_is_collapsed(self):
+        item = profile("dup", address="203.0.113.5")
+        item["outbounds"].insert(0, json.loads(json.dumps(item["outbounds"][0])))
+        proxies = render.extract_proxies([item], prefix="myvpn")
+        self.assertEqual([p["name"] for p in proxies["main"]], ["myvpn-main-01"])
+
     def test_unsupported_shape(self):
         with self.assertRaises(ValueError):
             render.normalize_profiles({"status": "ok"})

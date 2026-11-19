@@ -20,8 +20,15 @@ sources:
     # headers:                   # extra headers if your panel needs them
     #   x-hwid: "REPLACE-with-a-fixed-uuid"
 
-  # Second source example. Remove if you only have one subscription.
-  # othervpn:
-  #   url: "https://REPLACE"
+  # Happ install page (https://host/happ?token=...) is not the feed.
+  # The body lives at https://host/api/sub?token=... and panels with a device
+  # limit require a stable x-hwid (10–64 chars of [A-Za-z0-9=-]). Reuse the
+  # same value forever so the hub occupies one device slot.
+  # clo:
+  #   url: "https://REPLACE/api/sub?token=REPLACE"
   #   user_agent: "Happ/3.6.0"
-  #   dialect: generic
+  #   dialect: clo                 # «Обход LTE» → antiblock, other profiles → main
+  #   headers:
+  #     x-hwid: "vpnhub-home-01"
+  #     x-device-os: "Linux"
+  #     x-device-model: "vpn-hub"
